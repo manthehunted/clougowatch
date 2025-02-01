@@ -1,3 +1,10 @@
-cloudwatch # go binary
+# go binary
+cloudwatch
+
+# macOS
 .DS_Store
+
+# nix
 result
+
+*/
