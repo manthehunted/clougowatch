@@ -18,6 +18,7 @@ import (
 	"os"
 	"time"
 
+	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
@@ -42,9 +43,15 @@ func load() (aws.Config, *string) {
 	return cfg, result.Account
 }
 
+// parameters
 type TimeParam struct {
 	count int
 	max   *int
+}
+
+type CloudWatchParams struct {
+	queryInput cloudwatchlogs.StartQueryInput
+	timeInput  *TimeParam
 }
 
 func parseTimeParams(args []string) TimeParam {
@@ -62,6 +69,12 @@ func parseTimeParams(args []string) TimeParam {
 		}
 	}
 	return p
+}
+
+func parseParams(args []string) CloudWatchParams {
+	queryInput := parseCloudParams(args)
+	timeParams := parseTimeParams(args)
+	return CloudWatchParams{queryInput: queryInput, timeInput: &timeParams}
 }
 
 func parseCloudParams(args []string) cloudwatchlogs.StartQueryInput {
@@ -135,13 +148,25 @@ func parseCloudParams(args []string) cloudwatchlogs.StartQueryInput {
 	return inputs
 }
 
-func iterate(client *cloudwatchlogs.Client, ctx context.Context) types.QueryStatus {
-	queryId := ctx.Value(QUERYID).(*string)
-	output, err := client.GetQueryResults(ctx, &cloudwatchlogs.GetQueryResultsInput{QueryId: queryId})
-	if err != nil {
-		log.Fatalln(fmt.Sprintf("Failed to get CloudWatch results=%s, queryid=%s", err.Error(), *queryId))
+type CloudWatchAPI struct {
+	client cloudwatchlogs.Client
+	ctx    context.Context
+	logger *log.Logger
+	params *CloudWatchParams
+}
+
+func FromConfig(cfg aws.Config, logger *log.Logger) CloudWatchAPI {
+	client := cloudwatchlogs.NewFromConfig(cfg)
+	return CloudWatchAPI{client: *client, ctx: context.Background(), logger: logger}
+}
+
+func (api *CloudWatchAPI) GetQueryId() string {
+	str := api.ctx.Value(QUERYID).(*string)
+	if str != nil {
+		return *str
+	} else {
+		return ""
 	}
-	return output.Status
 }
 
 func convert(results [][]types.ResultField) []map[string]string {
@@ -158,6 +183,125 @@ func convert(results [][]types.ResultField) []map[string]string {
 	return arrays
 }
 
+func (api *CloudWatchAPI) Start(input *CloudWatchParams) {
+	api.params = input
+	queryOutput, err := api.client.StartQuery(api.ctx, &input.queryInput)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to start CloudWatch query with err=%s", err.Error()))
+	}
+
+	api.ctx = context.WithValue(api.ctx, QUERYID, queryOutput.QueryId)
+}
+
+func (api *CloudWatchAPI) iterate() types.QueryStatus {
+	queryId := api.GetQueryId()
+
+	output, err := api.client.GetQueryResults(api.ctx, &cloudwatchlogs.GetQueryResultsInput{QueryId: &queryId})
+	if err != nil {
+		log.Fatalln(fmt.Sprintf("Failed GetQueryResults=%s, queryid=%s", err.Error(), queryId))
+	}
+	return output.Status
+}
+
+// CloudWatch state machine
+func (api *CloudWatchAPI) Run() [][]types.ResultField {
+	var counter int64 = 0
+	var retry int = 0
+	var result [][]types.ResultField
+
+	client := &api.client
+	ctx := api.ctx
+	logger := api.logger
+	queryId := api.GetQueryId()
+	timeInput := api.params.timeInput
+
+done:
+	for {
+		switch status := api.iterate(); status {
+		case types.QueryStatusScheduled:
+			time.Sleep(500 * time.Millisecond)
+			logger.Println("Scheduled")
+		case types.QueryStatusRunning:
+			var duration int64
+			if counter*100 < 2000 {
+				duration = counter * 100
+				counter += 1
+			} else {
+				duration = 2000
+			}
+			sleep := time.Duration(duration) * time.Millisecond
+			if timeInput.max != nil {
+				maxDuration := time.Duration(*timeInput.max) * time.Second
+				if sleep > maxDuration {
+					sleep = maxDuration
+				}
+			}
+			time.Sleep(sleep)
+			api.logger.Println("Running")
+		case types.QueryStatusComplete:
+			api.logger.Println("Complete")
+			output, err := client.GetQueryResults(ctx, &cloudwatchlogs.GetQueryResultsInput{QueryId: &queryId})
+			if err != nil {
+				logger.Fatalln(fmt.Sprintf("Failed to get results: %s", err.Error()))
+			}
+			result = output.Results
+			break done
+		case types.QueryStatusFailed:
+			logger.Println("Query Failed")
+			if retry > MAX_RETRY {
+				logger.Println("reached maximum retry for status failed. exit loop")
+				break done
+			} else {
+				retry += 1
+			}
+		case types.QueryStatusCancelled:
+			logger.Println("Query Cancelled")
+			break done
+		case types.QueryStatusTimeout:
+			logger.Println("Query Timeout")
+			break done
+		case types.QueryStatusUnknown:
+			logger.Println("Query Unknown status")
+			if retry > MAX_RETRY {
+				logger.Println("reached maximum retry for status unknown. exit loop")
+				break done
+			} else {
+				retry += 1
+			}
+		}
+	}
+
+	return result
+}
+
+func (api *CloudWatchAPI) Write() bool {
+	return true
+}
+
+type storage struct {
+	dbpool *sqlitex.Pool
+	ctx    context.Context
+}
+
+func newStorage() storage {
+	dbpool, err := sqlitex.NewPool("file:data.db", sqlitex.PoolOptions{})
+	if err != nil {
+		// panic("failed to create new DB pool", err)
+		return storage{nil, nil}
+	}
+	ctx := context.TODO()
+	// conn, err := dbpool.Take(ctx)
+	return storage{dbpool, ctx}
+}
+
+func (s *storage) newConn() *sqlite.Conn {
+	conn, err := s.dbpool.Take(s.ctx)
+	if err != nil {
+		return nil
+	}
+	return conn
+}
+
 func main() {
 	f, err := os.OpenFile("logfile.log", os.O_RDWR|os.O_CREATE|os.O_APPEND|os.O_TRUNC, 0666)
 	if err != nil {
@@ -167,22 +311,14 @@ func main() {
 
 	logger := log.New(f, "logger: ", log.Lshortfile|log.Ldate|log.Ltime)
 
-	dbpool, err := sqlitex.NewPool("file:data.db", sqlitex.PoolOptions{})
-	if err != nil {
-		logger.Println("failed to create new DB pool")
-		panic(err)
+	storage := newStorage()
+	conn := storage.newConn()
+	if conn != nil {
+		defer storage.dbpool.Put(conn)
 	}
-	conn, err := dbpool.Take(context.TODO())
-	if conn == nil {
-		panic("no DB connection established")
-	} else if err != nil {
-		logger.Println("error from DB")
-		panic(err)
-	}
-	defer dbpool.Put(conn)
 
-	cmd, args := os.Args[1], os.Args[2:]
-	switch cmd {
+	task, args := os.Args[1], os.Args[2:]
+	switch task {
 	case "query":
 		logger.Println("query")
 	case "db":
@@ -251,18 +387,17 @@ func main() {
 
 		os.Exit(0)
 	default:
-		logger.Panic(fmt.Sprintf("unrecognizable cmd=%s", cmd))
+		logger.Panic(fmt.Sprintf("unrecognizable cmd=%s", task))
 	}
 
-	// Create an Amazon S3 service client
-	var getConfig = sync.OnceValue(func() aws.Config { cfg, _ := load(); return cfg })
-	cfg := getConfig()
-	client := cloudwatchlogs.NewFromConfig(cfg)
-	queryInput := parseCloudParams(args)
-	timeParams := parseTimeParams(args)
-
 	// create queries
-	stmt := conn.Prep("CREATE table IF NOT EXISTS queries(id INTEGER PRIMARY KEY autoincrement, query TEXT, groups TEXT, time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, queryid TEXT DEFAULT null);")
+	stmt := conn.Prep(`CREATE table IF NOT EXISTS queries(
+		time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		query TEXT,
+		groups TEXT,
+		queryid TEXT DEFAULT null,
+		primary key (time)
+	);`)
 	_, err = stmt.Step()
 	if err != nil {
 		logger.Println("failed to create table=queries")
@@ -277,103 +412,43 @@ func main() {
 		logger.Println(err)
 	}
 
-	ctxBg := context.Background()
-	// start CloudWatch query
-	queryOutput, err := client.StartQuery(ctxBg, &queryInput)
-	if err != nil {
-		logger.Fatalln(fmt.Sprintf("Failed to start CloudWatch query with err=%s", err.Error()))
-	}
+	// Create an Amazon S3 service client
+	var getConfig = sync.OnceValue(func() aws.Config { cfg, _ := load(); return cfg })
+	cfg := getConfig()
+	cloudApi := FromConfig(cfg, logger)
+	params := parseParams(args)
+	cloudApi.Start(&params)
 
-	queryId := queryOutput.QueryId
-	ctx := context.WithValue(ctxBg, QUERYID, queryId)
-
+	queryId := cloudApi.GetQueryId()
 	stmt = conn.Prep(`insert into queries (query, groups, queryid) values (:q, :g, :id)`)
-	stmt.SetText(":id", *queryId)
-	stmt.SetText(":q", *queryInput.QueryString)
-	if queryInput.LogGroupName != nil {
-		stmt.SetText(":g", *queryInput.LogGroupName)
+	stmt.SetText(":id", queryId)
+	stmt.SetText(":q", *(cloudApi.params.queryInput.QueryString))
+	if cloudApi.params.queryInput.LogGroupName != nil {
+		stmt.SetText(":g", *cloudApi.params.queryInput.LogGroupName)
 	} else {
-		stmt.SetText(":g", strings.Join(queryInput.LogGroupNames, ","))
+		stmt.SetText(":g", strings.Join(cloudApi.params.queryInput.LogGroupNames, ","))
 	}
 	_, err = stmt.Step()
 	if err != nil {
 		logger.Println(fmt.Sprintf("Failed to insert data with err=%s", err.Error()))
 	}
 
-	var counter int64 = 0
-	var retry int = 0
-	var results *[][]types.ResultField
-done:
-	for {
-		switch status := iterate(client, ctx); status {
-		case types.QueryStatusScheduled:
-			time.Sleep(500 * time.Millisecond)
-			logger.Println("Scheduled")
-		case types.QueryStatusRunning:
-			var mult int64
-			if counter*100 < 2000 {
-				mult = counter * 100
-				counter += 1
-			} else {
-				mult = 2000
-			}
-			t := time.Duration(mult) * time.Millisecond
-			if timeParams.max != nil {
-				t2 := time.Duration(*timeParams.max) * time.Second
-				if t2 > t {
-					t = t2
-				}
-			}
-			time.Sleep(t)
-			logger.Println("Running")
-		case types.QueryStatusComplete:
-			logger.Println("Complete")
-			output, err := client.GetQueryResults(ctx, &cloudwatchlogs.GetQueryResultsInput{QueryId: queryId})
-			if err != nil {
-				logger.Fatalln(fmt.Sprintf("Failed to get results: %s", err.Error()))
-			}
-			results = &output.Results
-			break done
-		case types.QueryStatusFailed:
-			logger.Println("Query Failed")
-			if retry > MAX_RETRY {
-				logger.Println("reached maximum retry for status failed. exit loop")
-				break done
-			} else {
-				retry += 1
-			}
-		case types.QueryStatusCancelled:
-			logger.Println("Query Cancelled")
-			break done
-		case types.QueryStatusTimeout:
-			logger.Println("Query Timeout")
-			break done
-		case types.QueryStatusUnknown:
-			logger.Println("Query Unknown status")
-			if retry > MAX_RETRY {
-				logger.Println("reached maximum retry for status unknown. exit loop")
-				break done
-			} else {
-				retry += 1
-			}
-		}
-	}
-
+	results := cloudApi.Run()
 	if results == nil {
-		logger.Fatalln(fmt.Sprintf("unexpectedly no results for queryid=%s", *queryId))
+		logger.Fatalln(fmt.Sprintf("unexpectedly no results for queryid=%s", queryId))
 	}
 
-	jsonb, err := json.Marshal(convert(*results))
+	jsonb, err := json.Marshal(convert(results))
 	if err != nil {
-		logger.Fatalln(fmt.Sprintf("Failed to encode result into json due to %s, queryid=%s", err.Error(), *queryId))
+		logger.Fatalln(fmt.Sprintf("Failed to encode result into json due to %s, queryid=%s", err.Error(), queryId))
 	}
 
 	stmt = conn.Prep("insert into results (queryid, result) values ($queryid, $result);")
-	stmt.SetText("$queryid", *queryId)
+	stmt.SetText("$queryid", queryId)
 	stmt.SetBytes("$result", jsonb)
 	_, err = stmt.Step()
 	if err != nil {
-		logger.Println(fmt.Sprintf("failed to insert for queryid=%s", *queryId))
+		logger.Println(fmt.Sprintf("failed to insert for queryid=%s", queryId))
 		logger.Println(err)
 	}
 	os.Exit(0)
