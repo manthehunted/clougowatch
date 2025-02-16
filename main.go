@@ -498,5 +498,11 @@ func main() {
 		"$queryid": *queryId,
 		"$result":  jsonb,
 	})
+
+	cmd := exec.Command("python", "../py/compare.py", *queryId)
+	out, err := cmd.Output()
+	fmt.Println(fmt.Sprintf("%s", out))
+	fmt.Println(fmt.Sprintf("%s", err))
+
 	os.Exit(0)
 }
