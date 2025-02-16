@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -283,41 +284,64 @@ type queryParams map[string]interface{}
 type storage struct {
 	dbpool *sqlitex.Pool
 	ctx    context.Context
-	conn   *sqlite.Conn
 }
 
 func newStorage() storage {
 	dbpool, err := sqlitex.NewPool("file:data.db", sqlitex.PoolOptions{})
 	if err != nil {
 		// panic("failed to create new DB pool", err)
-		return storage{nil, nil, nil}
+		return storage{nil, nil}
 	}
 	ctx := context.TODO()
-	return storage{dbpool, ctx, nil}
+	s := storage{dbpool, ctx}
+	conn := s.newConn()
+	defer s.closeConn(conn)
+
+	_ = s.Execute(`CREATE table IF NOT EXISTS queries(
+		time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		query TEXT,
+		groups TEXT,
+		queryid TEXT DEFAULT null,
+		primary key (time)
+	);`)
+
+	_ = s.Execute("CREATE table IF NOT EXISTS results(id INTEGER PRIMARY KEY autoincrement, queryid TEXT, result BLOB);")
+	return s
 }
 
-func (s *storage) newConn() {
+func (s *storage) newConn() *sqlite.Conn {
 	conn, err := s.dbpool.Take(s.ctx)
 	if err != nil {
 		// FIXME: warning
+		return nil
 	}
-	s.conn = conn
+	return conn
 }
 
-func (s *storage) closeConn() {
-	if s.conn != nil {
-		s.dbpool.Put(s.conn)
+func (s *storage) closeConn(conn *sqlite.Conn) {
+	if conn != nil {
+		s.dbpool.Put(conn)
 	}
 }
 
 func (s *storage) Execute(query string) error {
-	stmt := s.conn.Prep(query)
+	conn := s.newConn()
+	defer s.closeConn(conn)
+	if conn == nil {
+		return nil
+	}
+	stmt := conn.Prep(query)
 	_, err := stmt.Step()
 	return err
 }
 
 func (s *storage) Insert(query string, params queryParams) error {
-	stmt := s.conn.Prep(query)
+	conn := s.newConn()
+	defer s.closeConn(conn)
+	if conn == nil {
+		return nil
+	}
+	stmt := conn.Prep(query)
 
 	for key, value := range params {
 		switch value.(type) {
@@ -332,14 +356,16 @@ func (s *storage) Insert(query string, params queryParams) error {
 	return err
 }
 
-type Result struct {
+type CWResult struct {
 	result *[][]types.ResultField
 	err    error
 }
 
-func (r *Result) IsOk() bool {
+func (r *CWResult) IsOk() bool {
 	return r.result != nil
 }
+
+var getAWSConfig = sync.OnceValue(func() aws.Config { cfg, _ := load(); return cfg })
 
 func main() {
 	writer := os.Stdout
@@ -348,8 +374,6 @@ func main() {
 	logger := log.New(writer, "logger: ", log.Lshortfile|log.Ldate|log.Ltime)
 
 	storage := newStorage()
-	storage.newConn()
-	defer storage.closeConn()
 
 	task, args := os.Args[1], os.Args[2:]
 	switch task {
@@ -361,7 +385,9 @@ func main() {
 
 		// FIXME: cleanup
 		logger.Println(cmd)
-		stmt := storage.conn.Prep(fmt.Sprintf("%s", cmd))
+		conn := storage.newConn()
+		defer storage.closeConn(conn)
+		stmt := conn.Prep(fmt.Sprintf("%s", cmd))
 		data := make([][]string, 0)
 		ncols := stmt.ColumnCount()
 		nrow := 0
@@ -410,22 +436,11 @@ func main() {
 		logger.Panic(fmt.Sprintf("unrecognizable cmd=%s", task))
 	}
 
-	_ = storage.Execute(`CREATE table IF NOT EXISTS queries(
-		time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		query TEXT,
-		groups TEXT,
-		queryid TEXT DEFAULT null,
-		primary key (time)
-	);`)
-
-	_ = storage.Execute("CREATE table IF NOT EXISTS results(id INTEGER PRIMARY KEY autoincrement, queryid TEXT, result BLOB);")
-
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt)
-	resultChan := make(chan Result, 1)
+	resultChan := make(chan CWResult, 1)
 
-	var result Result
-	var getConfig = sync.OnceValue(func() aws.Config { cfg, _ := load(); return cfg })
+	var result CWResult
 	var ctx context.Context
 	var group string
 
@@ -434,8 +449,9 @@ func main() {
 	ctxC, cancelF := context.WithCancel(ctx)
 	defer cancelF()
 
-	cfg := getConfig()
+	cfg := getAWSConfig()
 	cloudApi := CloudWatchAPI{client: *cloudwatchlogs.NewFromConfig(cfg), logger: logger}
+
 	params := parseParams(args)
 	queryId := cloudApi.Start(ctxC, &params)
 	logger.Println(fmt.Sprintf("queryId: %s", *queryId))
@@ -456,8 +472,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		res, err := cloudApi.Run(*queryId, ctxC, time.Minute*5)
-		resultChan <- Result{result: res, err: err}
-
+		resultChan <- CWResult{result: res, err: err}
 	}()
 
 	select {
