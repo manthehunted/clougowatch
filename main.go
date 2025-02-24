@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -55,6 +56,11 @@ type TimeParam struct {
 type CloudWatchParams struct {
 	queryInput cloudwatchlogs.StartQueryInput
 	timeInput  *TimeParam
+}
+
+func (c *CloudWatchParams) Assign(b Bound) {
+	c.queryInput.StartTime = &b.start
+	c.queryInput.EndTime = &b.end
 }
 
 func parseTimeParams(args []string) TimeParam {
@@ -367,7 +373,7 @@ func (r *CWResult) IsOk() bool {
 
 var getAWSConfig = sync.OnceValue(func() aws.Config { cfg, _ := load(); return cfg })
 
-func main() {
+func _main() {
 	writer := os.Stdout
 	defer writer.Close()
 
@@ -376,11 +382,9 @@ func main() {
 	storage := newStorage()
 
 	task, args := os.Args[1], os.Args[2:]
+	// TODO: refactor to handler style
 	switch task {
-	case "query":
-		logger.Println("query")
 	case "db":
-		asRaw := false
 		cmd := args[0]
 
 		// FIXME: cleanup
@@ -419,19 +423,17 @@ func main() {
 			data = append(data, row)
 		}
 
-		if asRaw {
-			for idx, row := range data {
-				if idx > 0 {
-					os.Stdout.Write([]byte(fmt.Sprintf("%s", row)))
-				}
-			}
-		} else {
-			for _, row := range data {
-				os.Stdout.Write([]byte(fmt.Sprintf("%s\n", strings.Join(row, "||"))))
+		for idx, row := range data {
+			if idx > 0 {
+				os.Stdout.Write([]byte(fmt.Sprintf("%s", row)))
 			}
 		}
 
 		os.Exit(0)
+	case "query":
+		logger.Println("query")
+	case "longquery":
+		logger.Println("longquery")
 	default:
 		logger.Panic(fmt.Sprintf("unrecognizable cmd=%s", task))
 	}
@@ -505,4 +507,53 @@ func main() {
 	fmt.Println(fmt.Sprintf("%s", err))
 
 	os.Exit(0)
+}
+
+type Bound struct {
+	start int64
+	end   int64
+}
+
+func (b *Bound) split() (Bound, Bound) {
+	start := time.Unix(b.start, 0)
+	end := time.Unix(b.end, 0)
+	dur := time.Duration(float64(end.Sub(start))/2/math.Pow10(9)) * time.Second
+	s2 := start.Add(dur)
+	return Bound{start.Unix(), s2.Unix()}, Bound{s2.Unix(), end.Unix()}
+}
+
+func make2(b Bound, params CloudWatchParams, cfg aws.Config) {
+	writer := os.Stdout
+	logger := log.New(writer, "logger: ", log.Lshortfile|log.Ldate|log.Ltime)
+	cloudApi := CloudWatchAPI{client: *cloudwatchlogs.NewFromConfig(cfg), logger: logger}
+	params.Assign(b)
+
+	ctx := context.TODO()
+	queryId := cloudApi.Start(ctx, &params)
+	res, _ := cloudApi.Run(*queryId, ctx, time.Minute*5)
+	v, _ := strconv.Atoi(convert(*res)[0]["count()"])
+	if v <= 10000 {
+		logger.Println(fmt.Sprintf("done val=%d, id=%s, start=%d, end=%d", v, *queryId, *params.queryInput.StartTime, *params.queryInput.EndTime))
+		return
+	}
+
+	dur1, dur2 := b.split()
+	logger.Println(fmt.Sprintf("split1:(start=%d, end=%d), split2:(start=%d, end=%d)", dur1.start, dur1.end, dur2.start, dur2.end))
+	make2(dur1, params, cfg)
+	make2(dur2, params, cfg)
+}
+
+func main() {
+	writer := os.Stdout
+	logger := log.New(writer, "logger: ", log.Lshortfile|log.Ldate|log.Ltime)
+	cfg := getAWSConfig()
+	args := os.Args[2:]
+	params := parseParams(args)
+	b := Bound{*params.queryInput.StartTime, *params.queryInput.EndTime}
+	cloudApi := CloudWatchAPI{client: *cloudwatchlogs.NewFromConfig(cfg), logger: logger}
+	chs := search(b, params, cloudApi)
+	for _, k := range chs {
+		cloudApi.logger.Println(fmt.Sprintf("found bound: %+v", k))
+	}
+	logger.Println("done main")
 }
