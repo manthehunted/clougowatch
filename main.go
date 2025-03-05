@@ -47,6 +47,8 @@ func load() (aws.Config, *string) {
 	return cfg, result.Account
 }
 
+var getAWSConfig = sync.OnceValue(func() aws.Config { cfg, _ := load(); return cfg })
+
 type Query string
 
 func (q *Query) check() bool {
@@ -270,6 +272,7 @@ func (api *CloudWatchAPI) iterate(ctx context.Context) types.QueryStatus {
 
 	output, err := api.client.GetQueryResults(ctx, &cloudwatchlogs.GetQueryResultsInput{QueryId: &queryId})
 	if err != nil {
+		// FIXME: check api.logger is not nil
 		api.logger.Fatalln(fmt.Sprintf("Failed GetQueryResults=%s, queryid=%s", err.Error(), queryId))
 	}
 	return output.Status
@@ -283,6 +286,7 @@ func (api *CloudWatchAPI) Run(params *CloudWatchParams, ctx context.Context, tim
 	var result *[][]types.ResultField = nil
 
 	client := &api.client
+	// FIXME: check api.logger is not nil
 	logger := api.logger
 	queryId := params.queryId
 	timeInput := params.timeInput
@@ -446,6 +450,7 @@ func (s *Storage) Insert(query string, params queryParams) error {
 }
 
 type CWResult struct {
+	params *CloudWatchParams
 	result *CloudWatchResult
 	err    error
 }
@@ -453,8 +458,6 @@ type CWResult struct {
 func (r *CWResult) IsOk() bool {
 	return r.result != nil
 }
-
-var getAWSConfig = sync.OnceValue(func() aws.Config { cfg, _ := load(); return cfg })
 
 func main() {
 	writer := os.Stdout
@@ -523,10 +526,12 @@ func main() {
 
 	var bounds []Bound
 	params := parseParams(args)
-	if task == "query" {
-		bounds = make([]Bound, 1)
+
+	switch task {
+	case "query":
+		bounds = make([]Bound, 0)
 		bounds = append(bounds, NewBoundFromParams(params))
-	} else {
+	default:
 		bounds = findBounds(os.Args[2:], logger)
 		logger.Println(fmt.Sprintf("search len=%d,bounds=%+v", len(bounds), bounds))
 	}
@@ -535,56 +540,67 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt)
 	resultChan := make(chan CWResult, 4)
 	sem := make(chan struct{}, 4)
-	// done := make(chan bool, 1)
-
+	cancelFuncs := make([]func(), len(bounds))
 	wg := sync.WaitGroup{}
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	f := func(wg *sync.WaitGroup, ctx *context.Context) <-chan CWResult {
-		for _, bound := range bounds {
+		for idx, bound := range bounds {
 			sem <- struct{}{}
 			logger.Println(fmt.Sprintf("send bound=%+v", bound))
 			wg.Add(1)
 			go func(param CloudWatchParams, b Bound, wg *sync.WaitGroup, ctx *context.Context, sem <-chan struct{}, resultChan chan<- CWResult) {
 				defer wg.Done()
-				// defer cancelF()
 				p := param
 				bound := b
 				p.Assign(bound)
-				// FIXME:
-				ctxC, _ := context.WithCancel(*ctx)
+				ctxC, cancelFunc := context.WithCancel(*ctx)
+				cancelFuncs[idx] = cancelFunc
 				cloudapi := NewApi()
 				cloudapi.WithLogger(logger)
 				cloudapi.WithStorage(&storage)
 
 				res, err := cloudapi.Exec(ctxC, &p)
-				resultChan <- CWResult{result: &res, err: err}
+				resultChan <- CWResult{params: &p, result: &res, err: err}
 				<-sem
 			}(params, bound, wg, ctx, sem, resultChan)
 		}
-		logger.Println("closing")
 		close(sem)
 		return resultChan
 	}
-	r := f(&wg, &ctx)
+	ResultChan := f(&wg, &ctx)
 
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
 
-	c := 0
-	for range r {
-		fmt.Println(fmt.Sprintf("Done %d", c))
-		c += 1
+	counter := 0
+Exit:
+	for {
+		select {
+		case <-ResultChan:
+			fmt.Println(fmt.Sprintf("Done %d", counter))
+			counter += 1
+			if counter >= len(bounds) {
+				break Exit
+			}
+		case <-sigChan:
+			logger.Println("Cancelled")
+			for _, cancelF := range cancelFuncs {
+				cancelF()
+			}
+			break Exit
+		}
 	}
 	fmt.Println(fmt.Sprintf("end main"))
 
-	// python call
-	cmd := exec.Command("python", "../py/compare.py", *params.queryId)
-	out, err := cmd.Output()
-	fmt.Println(fmt.Sprintf("%s", out))
-	fmt.Println(fmt.Sprintf("%s", err))
+	if params.queryId != nil {
+		cmd := exec.Command("python", "../py/compare.py", *params.queryId)
+		out, err := cmd.Output()
+		fmt.Println(fmt.Sprintf("%s", out))
+		fmt.Println(fmt.Sprintf("%s", err))
+	}
 
 	os.Exit(0)
 }
@@ -646,8 +662,6 @@ func findBounds(args []string, logger *log.Logger) []Bound {
 	var newQuery string
 	if !query.check() {
 		newQuery = query.add()
-	} else if strings.Contains(strings.ReplaceAll(string(query), " ", ""), "|pattern") {
-		panic("not implemented")
 	} else {
 		newQuery = string(query)
 	}

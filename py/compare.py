@@ -221,9 +221,25 @@ def main(
 
 
 if __name__ == "__main__":
+    """
+    use case
+    1. Use CloudWatch Query
+    - eg) `fields @message | pattern @message`
+    - this must be `pattern`
+    2. Get CloudWatch Query Id
+    3. Python script automatically compare and shows differences between the current result and the previous result
+    """
+    # TODO: 1) keep the vetted records, 2) compare against the current result and the vetted results
     logger.debug("run main")
     if len(sys.argv) == 2:
         # to load into ipython kernel
         logger.debug(f"invoke with {sys.argv[1]}")
-        main(queryid=sys.argv[1])
+        queryid = sys.argv[1]
+        dbpath = "data.db"
+    elif len(sys.argv) == 3:
+        queryid = sys.argv[1]
+        dbpath = sys.argv[2]
+    else:
+        raise ValueError("len(input) needs to be 2 or 3")
+    main(queryid=queryid, fs=dbpath)
     logger.debug("done main")
