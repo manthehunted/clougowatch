@@ -1,9 +1,10 @@
 import logging
+from pathlib import Path
+import argparse
 import json
 import sys
 import re
 from contextlib import contextmanager
-from itertools import tee
 import sqlite3
 
 from typing import NewType
@@ -86,6 +87,19 @@ logger.addHandler(ch)
 logger.setLevel(logging.DEBUG)
 
 
+BCOLORS = dict(
+    HEADER="\033[95m",
+    OKBLUE="\033[94m",
+    OKCYAN="\033[96m",
+    OKGREEN="\033[92m",
+    WARNING="\033[93m",
+    FAIL="\033[91m",
+    ENDC="\033[0m",
+    BOLD="\033[1m",
+    UNDERLINE="\033[4m",
+)
+
+
 class DB:
     def __init__(self, name: str):
         self.session_maker = lambda: sqlite3.connect(name)
@@ -110,10 +124,11 @@ class DB:
                 cur.execute(query)
                 return cur.fetchall()
         except Exception as e:
-            logger.warning(e, exc_info=True)
+            logger.warning(f"while executing {query}: {e}", exc_info=True)
             return []
 
 
+## AWS CloudWatch related
 @dataclass(frozen=True, slots=True)
 class Patterned:
     PatternId: str
@@ -163,83 +178,265 @@ class Patterned:
         return cls(**kwargs)
 
 
-def get(cur, qid: str) -> dict:
-    iter = map(
-        Patterned.from_entry,
-        json.loads(
-            cur.execute(
-                f"select result from results where queryid='{qid}';"
-            ).fetchone()[0]
-        ),
-    )
-    return {str(k): v for k, v in zip(*tee(iter, 2))}
-
-
 Patterns = NewType("Patterns", tuple[list[Patterned], int])
 
 
-def compare(r1: Patterns, r2: Patterns) -> set:
-    rs1, t1 = r1
-    rs2, t2 = r2
-    if t1 > t2:
-        diff = set(rs1) - set(rs2)
-    else:
-        diff = set(rs2) - set(rs1)
-    return diff
+@dataclass(frozen=True, slots=True)
+class AuditEntries:
+    log_group: str
+    queryid: str
+    patterns: list[str]
+
+    @classmethod
+    def from_db_result(cls, queryid: str, db: DB):
+        q = """
+        WITH tmp AS (
+            select id, queryid, result from results where queryid='{qid}'
+        )
+        select queries.groups as log_group, tmp.queryid, tmp.result
+        from tmp
+        inner join queries on queries.queryid = tmp.queryid;
+        """.format(qid=queryid)
+        data = db.query(q)
+        assert len(data) == 1, len(data)
+        data = data[0]
+        output = dict(
+            zip(
+                [
+                    "log_group",
+                    "queryid",
+                ],
+                data[:-1],
+            )
+        )
+        res = list(
+            map(
+                Patterned.from_entry,
+                (json.loads(data[-1])),
+            )
+        )
+        output["patterns"] = res
+        return cls(**output)
+
+    def __iter__(self):
+        for entry in self.patterns:
+            yield {
+                "log_group": self.log_group,
+                "queryid": self.queryid,
+                "pattern": entry,
+            }
 
 
-def main(
-    queryid: str,
-    fs: str = "data.db",
-):
-    db = DB(fs)
-    query = f"""
-        select queryid, time
-        from (
-            with query AS (select query as this_query, groups as this_groups, time as this_time from queries where queryid = '{queryid}')
-            select queryid, query, groups, time, rank() over (partition by query, groups order by time DESC) num_rank
-            from queries
-            inner join query on (query.this_query = query) AND (query.this_groups = groups)
-            where time <= this_time)
-        where num_rank < 3
+def setup_db_audits_vetted(db: DB, delete_existing: bool = False):
+    delete_audits = """
+    drop table if exists audits;
     """
-    res = db.query(query)
 
-    assert len(res) < 3, "selected at most 2 entries, but not. check query above"
+    create_audits = """
+    create table if not exists audits (
+        id integer not null,
+        pattern_str blob not null,
+        log_group text not null,
+        queryid text not null,
+        vetted integer default 0,
+        PRIMARY KEY (pattern_str, log_group)
+        -- FOREIGN KEY(log_group) REFERENCES queries(groups)
+    );
+    """
 
-    if len(res) != 2:
-        logger.debug("not enough data to proceed")
-        return
+    delete_vetted = """
+    drop table if exists vetted;
+    """
 
-    col = ["queryid", "time"]
-    res = [dict(zip(col, entry)) for entry in res]
-    res = [Patterns((get(db.conn, d["queryid"]), d["time"])) for d in res]
-    for k in compare(*res):
-        logger.info(f"{k}")
+    create_vetted = """
+    create table if not exists vetted (
+        id integer not null,
+        pattern_str text not null,
+        time_auditted timestamp,
+        time_last_seen timestamp,
+        log_group text not null,
+        PRIMARY KEY (pattern_str, log_group)
+        -- FOREIGN KEY(id, pattern_str, log_group) REFERENCES audits(id, pattern_str, log_group)
+        -- FOREIGN KEY (log_group) REFERENCES audits(log_group) -- commented out since log_group is not unique
+        -- on delete cascade
+    );
+    """
 
+    delete_trigger1 = """
+    drop TRIGGER if exists vetted_pattern;
+    """
+
+    create_trigger1 = """
+    CREATE TRIGGER if not exists vetted_pattern
+    AFTER UPDATE ON audits
+    when old.vetted <> new.vetted
+    begin
+    insert into vetted (
+        id,
+        pattern_str,
+        time_auditted,
+        time_last_seen,
+        log_group
+    )
+    values(
+            old.id,
+            old.pattern_str,
+            DATETIME('NOW'),
+            DATETIME('NOW'), -- FIXME:
+            old.log_group
+    );
+    END
+    ;
+    """
+
+    # delete_trigger2 = """
+    # drop TRIGGER if exists delete_audit;
+    # """
+
+    # create_trigger2 = """
+    # CREATE TRIGGER if not exists delete_audit
+    # AFTER insert ON vetted
+    # BEGIN
+    #     delete from audits where id in (select id from vetted);
+    # END
+    # ;
+    # """
+
+    scripts = [
+        delete_audits,
+        delete_vetted,
+        delete_trigger1,
+        # delete_trigger2,
+        create_audits,
+        create_vetted,
+        create_trigger1,
+        # create_trigger2,
+    ]
+
+    if not delete_existing:
+        scripts = scripts[int(len(scripts) / 2) :]
+
+    conn = db.conn
+    cur = conn.cursor()
+    cur.execute("PRAGMA foreign_keys = ON;")
+    for script in scripts:
+        try:
+            cur.execute(script)
+        except Exception as e:
+            logger.warning(f"while executing {script}: {e}", exc_info=True)
+            return False
+    conn.commit()
+    return True
+
+
+def audit_list(db, group_names: None | list[str] = None) -> None:
+    s = ",".join(map(lambda x: f"'{x}'", group_names))
+    for qid in db.query(
+        f"select queryid from queries where groups in ({s}) and query like '%pattern%';"
+    ):
+        qid = qid[0]
+        data = AuditEntries.from_db_result(qid, db)
+        logger.debug(f"insert queryid={qid} with len(data)={len(data.patterns)}")
+        create_or_insert_to_audits(db, data)
+
+    _audit_list(db, group_names)
+
+
+def _audit_list(db, group_names: None | list[str] = None) -> None:
+    condition = " where vetted = 0"
+    if group_names:
+        condition += " and log_group in ({})".format(
+            ",".join(map(lambda x: "'{}'".format(x), group_names))
+        )
+    else:
+        condition += ""
+
+    results = db.query("select id, pattern_str from audits" + condition)
+
+    if len(results) == 0:
+        sys.stdout.write("no entry to audit\n")
+    else:
+        for i in results:
+            sys.stdout.write(
+                f"{BCOLORS['BOLD']}Audit id={BCOLORS['OKBLUE']}{i[0]}{BCOLORS['ENDC']}, pattern={BCOLORS['OKGREEN']}{i[1]}{BCOLORS['ENDC']}\n"
+            )
+
+
+# raise sqlite3
+def audit_mark(db, ids: list[int]) -> bool:
+    logger.debug("mark")
+    conn = db.conn
+    try:
+        conn.executemany(
+            "update audits set vetted = 1 where id in (?)", [[x] for x in ids]
+        )
+    except sqlite3.ProgrammingError as err:
+        conn.rollback()
+        logger.warning(f"rollback due to {err}", exc_info=True)
+        return False
+
+    conn.commit()
+    return True
+
+
+def create_or_insert_to_audits(db: DB, data: AuditEntries):
+    idx = db.query("select max(rowid) from audits;")
+    s = 0
+    if idx:
+        if idx[0][0]:
+            s = idx[0][0]
+    conn = db.conn
+    for idx, res in enumerate(data):
+        res: Patterned = res
+        to_insert = {
+            "id": s + idx,
+            "pattern_str": json.dumps(str(res["pattern"])).encode(),
+            "log_group": res["log_group"],
+            "queryid": res["queryid"],
+            "vetted": 0,
+        }
+
+        try:
+            conn.execute(
+                "insert into audits values(:id, :pattern_str, :log_group, :queryid, :vetted)",
+                to_insert,
+            )
+        except sqlite3.IntegrityError as err:
+            if "UNIQUE constraint failed" in str(err):
+                logger.debug("the same entry already exists.")
+            else:
+                logger.info("rollback", exc_info=True)
+            conn.rollback()
+        except Exception as e:
+            logger.warning(f"while insert into audits: {e}", exc_info=True)
+
+    conn.commit()
     return True
 
 
 if __name__ == "__main__":
     """
-    use case
-    1. Use CloudWatch Query
-    - eg) `fields @message | pattern @message`
-    - this must be `pattern`
-    2. Get CloudWatch Query Id
-    3. Python script automatically compare and shows differences between the current result and the previous result
+    Motivation
+    ==========
+    Audit and vet CloudWatch pattern, queried by keyword=`pattern` to
+    - find any new pattern(s) from a time period to another
+        - if auditted, the pattern is vetted and will not be present in future
+        - otherwise, analyze and resolve the pattern and its logs
     """
-    # TODO: 1) keep the vetted records, 2) compare against the current result and the vetted results
-    logger.debug("run main")
-    if len(sys.argv) == 2:
-        # to load into ipython kernel
-        logger.debug(f"invoke with {sys.argv[1]}")
-        queryid = sys.argv[1]
-        dbpath = "data.db"
-    elif len(sys.argv) == 3:
-        queryid = sys.argv[1]
-        dbpath = sys.argv[2]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("db", default="data.db", type=Path)
+    subparser = parser.add_subparsers()
+    parse_audit = subparser.add_parser("audit")
+    parse_audit.add_argument("--list", nargs="+", type=str, default=None)
+    parse_audit.add_argument("--mark", nargs="+", type=int, default=None)
+
+    args = parser.parse_args()
+    db = DB(args.db)
+
+    setup_db_audits_vetted(db)
+    if args.list is not None:
+        audit_list(db, args.list)
+    elif args.mark is not None:
+        audit_mark(db, args.mark)
     else:
-        raise ValueError("len(input) needs to be 2 or 3")
-    main(queryid=queryid, fs=dbpath)
-    logger.debug("done main")
+        raise RuntimeError("unreachable")
