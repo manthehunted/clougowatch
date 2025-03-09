@@ -393,10 +393,17 @@ func newStorage() Storage {
 		query TEXT,
 		groups TEXT,
 		queryid TEXT DEFAULT null,
-		primary key (time)
+		primary key (time),
 	);`)
 
-	_ = s.Execute("CREATE table IF NOT EXISTS results(id INTEGER PRIMARY KEY autoincrement, queryid TEXT, result BLOB);")
+	_ = s.Execute(`
+		CREATE table IF NOT EXISTS results(
+			id INTEGER PRIMARY KEY autoincrement,
+			queryid TEXT,
+			result BLOB,
+			PRIMARY KEY (id, queryid)
+		);
+	`)
 	return s
 }
 
