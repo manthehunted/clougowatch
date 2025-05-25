@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -19,7 +18,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
-	"log"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+
 	"time"
 
 	"zombiezen.com/go/sqlite"
@@ -30,25 +31,72 @@ const shortForm = "2006-01-02"
 const MAX_RETRY = 3
 const QUERYID = "queryId"
 
-var once sync.Once
+// AWS
+var AwsConfig *aws.Config
 
 func load() (aws.Config, *string) {
 	// Load the Shared AWS Configuration (~/.aws/config)
+	fmt.Println("config")
 	cfg, err := config.LoadDefaultConfig(context.TODO())
+	fmt.Println("config1")
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println(err)
+		log.Err(err)
+		os.Exit(1)
 	}
 	client := sts.NewFromConfig(cfg)
 	input := &sts.GetCallerIdentityInput{}
 	result, err := client.GetCallerIdentity(context.TODO(), input)
+	fmt.Println("config2")
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println(err)
+		log.Err(err)
+		os.Exit(1)
 	}
 	return cfg, result.Account
 }
 
-var getAWSConfig = sync.OnceValue(func() aws.Config { cfg, _ := load(); return cfg })
+// End AWS
 
+// Logging
+var LogLevel *zerolog.Level
+var EnvLogLevel = map[string]zerolog.Level{
+	"debug": zerolog.DebugLevel,
+	"info":  zerolog.InfoLevel,
+	"warn":  zerolog.WarnLevel,
+	"error": zerolog.ErrorLevel,
+}
+
+type Logging interface {
+	Debug(string)
+	Info(string)
+	Warning(string)
+	Error(string)
+}
+
+type Logger struct {
+	logger *zerolog.Logger
+}
+
+func (l Logger) Debug(s string) {
+	l.logger.Debug().Msg(fmt.Sprintf("%s\n", s))
+}
+
+func (l Logger) Info(s string) {
+	l.logger.Info().Msg(fmt.Sprintf("%s\n", s))
+}
+
+func (l Logger) Warning(s string) {
+	l.logger.Warn().Msg(fmt.Sprintf("%s\n", s))
+}
+
+func (l Logger) Error(s string) {
+	l.logger.Error().Msg(fmt.Sprintf("%s\n", s))
+}
+
+// End Logging
+
+// Query
 type Query string
 
 func (q *Query) check() bool {
@@ -62,16 +110,19 @@ func (q *Query) add() string {
 	return s
 }
 
-// parameters
+// End Query
+
+// Parameters
 type TimeParam struct {
 	count int
 	max   *int
 }
 
 type CloudWatchParams struct {
-	queryInput cloudwatchlogs.StartQueryInput
-	timeInput  *TimeParam
-	queryId    *string
+	queryInput           cloudwatchlogs.StartQueryInput
+	timeInput            *TimeParam
+	queryId              *string
+	fetchAllLengthyQuery bool
 }
 
 func (p *CloudWatchParams) AssignId(queryid *string) {
@@ -100,10 +151,24 @@ func parseTimeParams(args []string) TimeParam {
 	return p
 }
 
+func parseLengthyQuery(args []string) bool {
+	// if yes, get all logs for lengthy cloudwatch logs
+	var isYes bool
+	for idx := 0; idx < len(args); idx += 2 {
+		switch args[idx] {
+		case "-y":
+			isYes = true
+			return isYes
+		}
+	}
+	return isYes
+}
+
 func parseParams(args []string) CloudWatchParams {
 	queryInput := parseCloudParams(args)
 	timeParams := parseTimeParams(args)
-	return CloudWatchParams{queryInput: queryInput, timeInput: &timeParams}
+	fetchAllLengthyQuery := parseLengthyQuery(args)
+	return CloudWatchParams{queryInput: queryInput, timeInput: &timeParams, fetchAllLengthyQuery: fetchAllLengthyQuery}
 }
 
 func parseCloudParams(args []string) cloudwatchlogs.StartQueryInput {
@@ -173,26 +238,33 @@ func parseCloudParams(args []string) cloudwatchlogs.StartQueryInput {
 			//LogGroupNames []string
 			v := strings.Split(args[idx+1], ",")
 			inputs.LogGroupNames = v
+		default:
+			panic(fmt.Sprintf("unrecognized flag %s", args[idx]))
 		}
 	}
 	return inputs
 }
 
+// End Parameters
+
+// CloudWatchAPI
 // FROM: https://pkg.go.dev/context
 // Do not store Contexts inside a struct type; instead, pass a Context explicitly to each function that needs it.
 // The Context should be the first parameter, typically named ctx:
 type CloudWatchAPI struct {
 	client  cloudwatchlogs.Client
-	logger  *log.Logger
+	logger  Logging
 	storage *Storage // NOTE: can be interfaced
 }
 
 func NewApi() CloudWatchAPI {
-	cfg := getAWSConfig()
-	return CloudWatchAPI{client: *cloudwatchlogs.NewFromConfig(cfg)}
+	if AwsConfig == nil {
+		panic("aws config is not loaded correctly. Check ~/.aws")
+	}
+	return CloudWatchAPI{client: *cloudwatchlogs.NewFromConfig(*AwsConfig)}
 }
 
-func (api *CloudWatchAPI) WithLogger(logger *log.Logger) {
+func (api *CloudWatchAPI) WithLogger(logger Logging) {
 	api.logger = logger
 }
 
@@ -209,46 +281,48 @@ func (api *CloudWatchAPI) GetQueryId(ctx context.Context) string {
 	}
 }
 
-func (api *CloudWatchAPI) Exec(ctx context.Context, input *CloudWatchParams) (CloudWatchResult, error) {
+func (api *CloudWatchAPI) Exec(ctx context.Context, input *CloudWatchParams) CWResult {
 	err := api.Start(ctx, input)
 	if err != nil {
-		return make(CloudWatchResult, 0), err
+		return CWResult{err: err}
 	}
 	res, err := api.Run(input, ctx, time.Minute*5)
 	if err != nil {
-		return make(CloudWatchResult, 0), err
+		return CWResult{err: err}
 	}
-	result := convert(*res)
+	converted := convert(*res)
+	jsonb, err := json.Marshal(converted)
+	if err != nil {
+		api.logger.Error(fmt.Sprintf("Failed to encode result into json due to %s, queryid=%s", err, *input.queryId))
+	}
 
 	if api.storage != nil {
-		jsonb, err := json.Marshal(result) // FIXME: take care json encoding err
+		err = api.storage.Insert("insert into results (queryid, result) values ($queryid, $result);", queryParams{
+			"$queryid": *input.queryId,
+			"$result":  jsonb,
+		})
+
 		if err != nil {
-			api.logger.Println(fmt.Sprintf("Failed to encode result into json due to %s, queryid=%s", err, *input.queryId))
+			api.logger.Warning(err.Error())
 		} else {
-			err = api.storage.Insert("insert into results (queryid, result) values ($queryid, $result);", queryParams{
-				"$queryid": *input.queryId,
-				"$result":  jsonb,
-			})
-			if err != nil {
-				api.logger.Println(err) // FIXME: put warning
-			} else {
-				api.logger.Println(fmt.Sprintf("inserted result for %s", *input.queryId))
-			}
+			api.logger.Debug(fmt.Sprintf("inserted result for %s", *input.queryId))
 		}
 	}
-	return result, nil
+
+	result := CWResult{params: input, result: &converted, json: jsonb, err: err}
+	return result
 }
 
 func (api *CloudWatchAPI) Start(ctx context.Context, input *CloudWatchParams) error {
-	api.logger.Println(fmt.Sprintf("start query %s", *input.queryInput.QueryString))
+	api.logger.Debug(fmt.Sprintf("start query %s", *input.queryInput.QueryString))
 	queryOutput, err := api.client.StartQuery(ctx, &input.queryInput)
 	if err != nil {
-		api.logger.Println(fmt.Sprintf("Failed to start CloudWatch query with err=%s", err.Error()))
+		api.logger.Error(fmt.Sprintf("Failed to start CloudWatch query with err=%s", err.Error()))
 		return err
 	}
 	queryId := queryOutput.QueryId
 	input.AssignId(queryId)
-	api.logger.Println(fmt.Sprintf("create queryId=%s, start=%d, end=%d", *queryOutput.QueryId, *input.queryInput.StartTime, *input.queryInput.EndTime))
+	api.logger.Debug(fmt.Sprintf("create queryId=%s, start=%d, end=%d", *queryOutput.QueryId, *input.queryInput.StartTime, *input.queryInput.EndTime))
 
 	if api.storage != nil {
 		var group string
@@ -262,6 +336,7 @@ func (api *CloudWatchAPI) Start(ctx context.Context, input *CloudWatchParams) er
 			":q":  *(input.queryInput.QueryString),
 			":g":  group,
 		}
+		api.logger.Debug(fmt.Sprintf("insert %s", *input.queryId))
 		_ = api.storage.Insert(`insert into queries (query, groups, queryid) values (:q, :g, :id)`, insertParams)
 	}
 	return nil
@@ -273,7 +348,7 @@ func (api *CloudWatchAPI) iterate(ctx context.Context) types.QueryStatus {
 	output, err := api.client.GetQueryResults(ctx, &cloudwatchlogs.GetQueryResultsInput{QueryId: &queryId})
 	if err != nil {
 		// FIXME: check api.logger is not nil
-		api.logger.Fatalln(fmt.Sprintf("Failed GetQueryResults=%s, queryid=%s", err.Error(), queryId))
+		api.logger.Error(fmt.Sprintf("Failed GetQueryResults=%s, queryid=%s", err.Error(), queryId))
 	}
 	return output.Status
 }
@@ -286,20 +361,19 @@ func (api *CloudWatchAPI) Run(params *CloudWatchParams, ctx context.Context, tim
 	var result *[][]types.ResultField = nil
 
 	client := &api.client
-	// FIXME: check api.logger is not nil
 	logger := api.logger
 	queryId := params.queryId
 	timeInput := params.timeInput
 	ctx = context.WithValue(ctx, QUERYID, queryId)
 	ctxWT, cancelFunc := context.WithTimeout(ctx, timeout)
 	defer cancelFunc()
-	logger.Println(fmt.Sprintf("exec id=%s, query=%s, start=%d, end=%d", *params.queryId, *params.queryInput.QueryString, *params.queryInput.StartTime, *params.queryInput.EndTime))
+	logger.Info(fmt.Sprintf("exec id=%s, query=%s, start=%d, end=%d", *params.queryId, *params.queryInput.QueryString, *params.queryInput.StartTime, *params.queryInput.EndTime))
 
 	for {
 		switch status := api.iterate(ctxWT); status {
 		case types.QueryStatusScheduled:
 			time.Sleep(100 * time.Millisecond)
-			logger.Println("Scheduled")
+			logger.Debug("Scheduled")
 		case types.QueryStatusRunning:
 			var duration int64
 			if counter*100 < 2000 {
@@ -316,47 +390,62 @@ func (api *CloudWatchAPI) Run(params *CloudWatchParams, ctx context.Context, tim
 				}
 			}
 			time.Sleep(sleep)
-			api.logger.Println("Running")
+			api.logger.Debug("Running")
 		case types.QueryStatusComplete:
-			api.logger.Println("Complete")
+			api.logger.Debug("Complete")
 			output, errGetResult := client.GetQueryResults(ctx, &cloudwatchlogs.GetQueryResultsInput{QueryId: queryId})
 			if errGetResult != nil {
 				err = errGetResult
 			}
 			result = &output.Results
-			api.logger.Println(fmt.Sprintf("Got Result, id=%s, len=%d", *params.queryId, len(*result)))
+			api.logger.Debug(fmt.Sprintf("Got Result, id=%s, len=%d", *params.queryId, len(*result)))
 			return result, err
 		case types.QueryStatusFailed:
-			logger.Println("Query Failed")
+			logger.Debug("Query Failed")
 			if retry > MAX_RETRY {
-				logger.Println("reached maximum retry for status failed. exit loop")
+				logger.Info("reached maximum retry for status failed. exit loop")
 				err = errors.New(string(status))
 				return result, nil
 			} else {
 				retry += 1
 			}
 		case types.QueryStatusCancelled:
-			logger.Println("Query Cancelled")
+			logger.Debug("Query Cancelled")
 			err = errors.New(string(status))
 			return result, err
 		case types.QueryStatusTimeout:
-			logger.Println("Query Timeout")
+			logger.Debug("Query Timeout")
 			err = errors.New(string(status))
 			return result, err
 		case types.QueryStatusUnknown:
-			logger.Println("Query Unknown status")
+			logger.Debug("Query Unknown status")
 			if retry > MAX_RETRY {
-				logger.Println("reached maximum retry for status unknown. exit loop")
+				logger.Info("reached maximum retry for status unknown. exit loop")
 				err = errors.New(string(status))
 				return result, err
 			} else {
 				retry += 1
 			}
+		default:
+			panic(status)
 		}
 	}
 }
 
 type CloudWatchResult = []map[string]string
+
+type CWResult struct {
+	params *CloudWatchParams
+	result *CloudWatchResult
+	json   []byte
+	err    error
+}
+
+func (r *CWResult) IsOk() bool {
+	return r.result != nil
+}
+
+// End CloudWatchAPI
 
 func convert(results [][]types.ResultField) CloudWatchResult {
 
@@ -372,38 +461,29 @@ func convert(results [][]types.ResultField) CloudWatchResult {
 	return arrays
 }
 
+// Storage
 type Storage struct {
-	dbpool *sqlitex.Pool
-	ctx    context.Context
+	dbpool   *sqlitex.Pool
+	ctx      context.Context
+	dbmutext *sync.Mutex
 }
 
 func newStorage() Storage {
 	dbpool, err := sqlitex.NewPool("file:data.db", sqlitex.PoolOptions{})
 	if err != nil {
 		// panic("failed to create new DB pool", err)
-		return Storage{nil, nil}
+		return Storage{dbpool: nil, ctx: nil}
 	}
 	ctx := context.TODO()
-	s := Storage{dbpool, ctx}
+	mu := sync.Mutex{}
+	s := Storage{dbpool: dbpool, ctx: ctx, dbmutext: &mu}
 	conn := s.newConn()
 	defer s.closeConn(conn)
 
-	_ = s.Execute(`CREATE table IF NOT EXISTS queries(
-		time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		query TEXT,
-		groups TEXT,
-		queryid TEXT DEFAULT null,
-		primary key (time),
-	);`)
+	_ = s.Execute(`CREATE table IF NOT EXISTS queries(id INTEGER PRIMARY KEY AUTOINCREMENT, time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, query TEXT, groups TEXT, queryid TEXT DEFAULT null);`)
+	_ = s.Execute(`CREATE UNIQUE INDEX IF NOT EXISTS queries_index ON queries(id, time);`)
 
-	_ = s.Execute(`
-		CREATE table IF NOT EXISTS results(
-			id INTEGER PRIMARY KEY autoincrement,
-			queryid TEXT,
-			result BLOB,
-			PRIMARY KEY (id, queryid)
-		);
-	`)
+	_ = s.Execute(`CREATE table IF NOT EXISTS results(queryid TEXT, result BLOB, FOREIGN KEY (queryid) REFERENCES queries(queryid));`)
 	return s
 }
 
@@ -456,92 +536,39 @@ func (s *Storage) Insert(query string, params queryParams) error {
 	return err
 }
 
-type CWResult struct {
-	params *CloudWatchParams
-	result *CloudWatchResult
-	err    error
-}
+// End Storage
 
-func (r *CWResult) IsOk() bool {
-	return r.result != nil
+func init() {
+	cfg, _ := load()
+	AwsConfig = &cfg
+	level, exist := os.LookupEnv("LogLevel")
+	if !exist {
+		level = "info"
+	} else {
+		level = strings.ToLower(level)
+	}
+	zerologlevel := EnvLogLevel[level]
+	LogLevel = &zerologlevel
 }
 
 func main() {
-	writer := os.Stdout
-	defer writer.Close()
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	zerolog.SetGlobalLevel(*LogLevel)
+	logger := log.Logger
 
-	logger := log.New(writer, "logger: ", log.Lshortfile|log.Ldate|log.Ltime)
-
+	logger.Info().Msg(fmt.Sprintf("main"))
 	storage := newStorage()
 
-	task, args := os.Args[1], os.Args[2:]
-	// TODO: refactor to handler style
-	switch task {
-	case "db":
-		cmd := args[0]
-
-		// FIXME: cleanup
-		logger.Println(cmd)
-		conn := storage.newConn()
-		defer storage.closeConn(conn)
-		stmt := conn.Prep(fmt.Sprintf("%s", cmd))
-		data := make([][]string, 0)
-		ncols := stmt.ColumnCount()
-		nrow := 0
-
-		for {
-			hasRow, err := stmt.Step()
-			if err != nil {
-				logger.Println(fmt.Sprintf("while step DB with %s", err.Error()))
-			}
-
-			if !(hasRow) && (nrow == 0) {
-				logger.Fatalln("unexpectedly no data. Check DB entry or query")
-			} else if !hasRow {
-				break
-			}
-			if nrow == 0 {
-				columns := make([]string, ncols)
-				for i := 0; i <= ncols; i++ {
-					columns = append(columns, stmt.ColumnName(i))
-				}
-				data = append(data, columns)
-				nrow += 1
-			}
-
-			row := make([]string, ncols)
-			for i := 0; i <= ncols; i++ {
-				row = append(row, stmt.ColumnText(i))
-			}
-			data = append(data, row)
-		}
-
-		for idx, row := range data {
-			if idx > 0 {
-				os.Stdout.Write([]byte(fmt.Sprintf("%s", row)))
-			}
-		}
-
-		os.Exit(0)
-	case "query":
-		logger.Println("query")
-	case "longquery":
-		logger.Println("longquery")
-	default:
-		logger.Panic(fmt.Sprintf("unrecognizable cmd=%s", task))
-	}
+	args := os.Args[1:]
 
 	var bounds []Bound
 	params := parseParams(args)
+	logger.Info().Msg(fmt.Sprintf("query=%s", *params.queryInput.QueryString))
 
-	switch task {
-	case "query":
-		bounds = make([]Bound, 0)
-		bounds = append(bounds, NewBoundFromParams(params))
-	default:
-		bounds = findBounds(os.Args[2:], logger)
-		logger.Println(fmt.Sprintf("search len=%d,bounds=%+v", len(bounds), bounds))
-	}
+	ctx := context.Background()
+	ctx = logger.WithContext(ctx)
+	bounds = findBounds(ctx, params)
+	log.Info().Msg(fmt.Sprintf("search len=%d,bounds=%+v", len(bounds), bounds))
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt)
@@ -549,33 +576,34 @@ func main() {
 	sem := make(chan struct{}, 4)
 	cancelFuncs := make([]func(), len(bounds))
 	wg := sync.WaitGroup{}
-	ctx := context.Background()
 
-	f := func(wg *sync.WaitGroup, ctx *context.Context) <-chan CWResult {
+	f := func(wg *sync.WaitGroup, ctx context.Context) <-chan CWResult {
 		for idx, bound := range bounds {
 			sem <- struct{}{}
-			logger.Println(fmt.Sprintf("send bound=%+v", bound))
+			logger.Info().Msg(fmt.Sprintf("send bound=%+v", bound))
 			wg.Add(1)
-			go func(param CloudWatchParams, b Bound, wg *sync.WaitGroup, ctx *context.Context, sem <-chan struct{}, resultChan chan<- CWResult) {
+			go func(param CloudWatchParams, b Bound, wg *sync.WaitGroup, ctx context.Context, sem <-chan struct{}, resultChan chan<- CWResult) {
 				defer wg.Done()
 				p := param
 				bound := b
 				p.Assign(bound)
-				ctxC, cancelFunc := context.WithCancel(*ctx)
+				ctxC, cancelFunc := context.WithCancel(ctx)
 				cancelFuncs[idx] = cancelFunc
 				cloudapi := NewApi()
-				cloudapi.WithLogger(logger)
+				cloudapi.WithLogger(Logger{zerolog.Ctx(ctx)})
 				cloudapi.WithStorage(&storage)
 
-				res, err := cloudapi.Exec(ctxC, &p)
-				resultChan <- CWResult{params: &p, result: &res, err: err}
+				res := cloudapi.Exec(ctxC, &p)
+				if res.result != nil {
+					resultChan <- res
+				}
 				<-sem
 			}(params, bound, wg, ctx, sem, resultChan)
 		}
 		close(sem)
 		return resultChan
 	}
-	ResultChan := f(&wg, &ctx)
+	ResultChan := f(&wg, ctx)
 
 	go func() {
 		wg.Wait()
@@ -586,7 +614,8 @@ func main() {
 Exit:
 	for {
 		select {
-		case <-ResultChan:
+		case res := <-ResultChan:
+			fmt.Println(fmt.Sprintf("%s, CWResultJson=%s", *res.params.queryId, res.json))
 			fmt.Println(fmt.Sprintf("Done %d", counter))
 			counter += 1
 			if counter >= len(bounds) {
@@ -601,13 +630,6 @@ Exit:
 		}
 	}
 	fmt.Println(fmt.Sprintf("end main"))
-
-	if params.queryId != nil {
-		cmd := exec.Command("python", "../py/compare.py", *params.queryId)
-		out, err := cmd.Output()
-		fmt.Println(fmt.Sprintf("%s", out))
-		fmt.Println(fmt.Sprintf("%s", err))
-	}
 
 	os.Exit(0)
 }
@@ -633,19 +655,25 @@ func (b Bound) split() (Bound, Bound) {
 func searchBound(b Bound, params CloudWatchParams, cloudapi CloudWatchAPI, arr []Bound) []Bound {
 	ctx := context.TODO()
 	params.Assign(b)
-	res, err := cloudapi.Exec(ctx, &params)
-	if err != nil {
-		// FIXME:
+	res := cloudapi.Exec(ctx, &params)
+	if res.err != nil {
+		panic(fmt.Sprintf("FIXME: to implement to address: %s", res.err.Error()))
 	}
-	v, _ := strconv.Atoi(res[0]["count()"])
+	v, _ := strconv.Atoi((*res.result)[0]["count()"])
 	if v <= 10000 {
+		cloudapi.logger.Debug("proceeding since less than 10000")
 		arr = append(arr, b)
-		cloudapi.logger.Println(fmt.Sprintf("done val=%d, id=%s, start=%d, end=%d", v, *params.queryId, *params.queryInput.StartTime, *params.queryInput.EndTime))
-	} else {
+		cloudapi.logger.Debug(fmt.Sprintf("done val=%d, id=%s, start=%d, end=%d", v, *params.queryId, *params.queryInput.StartTime, *params.queryInput.EndTime))
+	} else if params.fetchAllLengthyQuery {
+		cloudapi.logger.Debug("split")
 		dur1, dur2 := b.split()
-		cloudapi.logger.Println(fmt.Sprintf("val=%d, split1:(start=%d, end=%d), split2:(start=%d, end=%d)", v, dur1.start, dur1.end, dur2.start, dur2.end))
+		cloudapi.logger.Debug(fmt.Sprintf("val=%d, split1:(start=%d, end=%d), split2:(start=%d, end=%d)", v, dur1.start, dur1.end, dur2.start, dur2.end))
 		arr = searchBound(dur1, params, cloudapi, arr)
 		arr = searchBound(dur2, params, cloudapi, arr)
+	} else {
+		cloudapi.logger.Debug("skipping")
+		arr = append(arr, b)
+		cloudapi.logger.Debug(fmt.Sprintf("done val=%d, id=%s, start=%d, end=%d", v, *params.queryId, *params.queryInput.StartTime, *params.queryInput.EndTime))
 	}
 	return arr
 }
@@ -656,14 +684,14 @@ func search(b Bound, params CloudWatchParams, cloudapi CloudWatchAPI) []Bound {
 	return arr
 }
 
-func findBounds(args []string, logger *log.Logger) []Bound {
+func findBounds(ctx context.Context, params CloudWatchParams) []Bound {
 	// Since CloudWatch limits the output to 10000
 	// this function devides the start / end time by half
 	// and sequencially finds a pair (start, end)
 	// in which a total count is less than 10000.
 	cloudapi := NewApi()
-	cloudapi.WithLogger(logger)
-	params := parseParams(args)
+	cloudapi.WithLogger(Logger{zerolog.Ctx(ctx)})
+	cloudapi.logger.Debug("find bounds")
 
 	query := Query(*params.queryInput.QueryString)
 	var newQuery string
@@ -673,9 +701,10 @@ func findBounds(args []string, logger *log.Logger) []Bound {
 		newQuery = string(query)
 	}
 	params.queryInput.QueryString = aws.String(newQuery)
-	logger.Println(newQuery)
+	cloudapi.logger.Debug(newQuery)
 
 	b := Bound{*params.queryInput.StartTime, *params.queryInput.EndTime}
 	chs := search(b, params, cloudapi)
+	cloudapi.logger.Debug("Done finding bounds")
 	return chs
 }
